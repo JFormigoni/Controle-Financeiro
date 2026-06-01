@@ -1,0 +1,211 @@
+// Prisma schema da Plataforma de Gestão Financeira e Controle de Gastos.
+//
+// Modela o ERD definido em design.md (seção "Data Models"):
+// User, Category, Transaction, Goal, Session, AccessLog, ConsentRecord e
+// VerificationToken. Valores monetários (`amount`, `targetAmount`,
+// `accumulatedAmount`) são persistidos como `Decimal` no PostgreSQL para evitar
+// imprecisão de ponto flutuante; a camada de domínio os manipula como inteiros
+// de centavos (`Money`), convertendo nas bordas da aplicação.
+//
+// Requisitos cobertos: 1.1 (cadastro/unicidade de e-mail), 6.1/7.1 (lançamentos),
+// 8.1 (categorias), 9.1 (metas), 15.1 (logs de acesso), 16.9 (registro de
+// consentimento LGPD).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  // Conexão "pooled" (PgBouncer, porta 6543) usada pela aplicação em runtime.
+  url       = env("DATABASE_URL")
+  // Conexão direta (porta 5432) usada por `prisma migrate deploy`.
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+/// Tipo de lançamento financeiro: receita ou despesa (Req. 6, 7, 8).
+enum TransactionType {
+  INCOME
+  EXPENSE
+}
+
+/// Papel do usuário na plataforma (Req. 14, 15).
+enum UserRole {
+  USER
+  ADMIN
+}
+
+/// Estado da conta. Contas inativas não podem autenticar (Req. 14.3, 14.5).
+enum AccountStatus {
+  ACTIVE
+  INACTIVE
+}
+
+/// Frequência de recorrência de lançamentos (Req. 6.5, 7.5).
+enum Frequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+/// Finalidade de um token de verificação de uso único (Req. 1.3, 3.1, 4.4).
+enum TokenPurpose {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+  EMAIL_CHANGE
+}
+
+/// Ação registrada no log de acesso (Req. 15.1).
+enum AccessAction {
+  LOGIN
+  LOGOUT
+  SESSION_EXPIRED
+}
+
+// ---------------------------------------------------------------------------
+// Modelos
+// ---------------------------------------------------------------------------
+
+/// Conta de usuário. Mantém o estado de verificação de e-mail, papel, status e
+/// o estado de bloqueio de login (Req. 1.1, 2.6, 2.8, 2.9, 14.5).
+model User {
+  id                  String        @id @default(cuid())
+  name                String
+  email               String        @unique
+  passwordHash        String
+  emailVerified       Boolean       @default(false)
+  role                UserRole      @default(USER)
+  status              AccountStatus @default(ACTIVE)
+  failedLoginAttempts Int           @default(0)
+  lockedUntil         DateTime?
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  categories         Category[]
+  transactions       Transaction[]
+  goals              Goal[]
+  sessions           Session[]
+  accessLogs         AccessLog[]
+  consentRecords     ConsentRecord[]
+  verificationTokens VerificationToken[]
+
+  @@index([email])
+}
+
+/// Categoria de classificação de lançamentos, exclusivamente Receita ou Despesa
+/// e única por conta + tipo (Req. 8.1, 8.2, 8.6).
+model Category {
+  id        String          @id @default(cuid())
+  userId    String
+  name      String
+  type      TransactionType
+  createdAt DateTime        @default(now())
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+
+  @@unique([userId, type, name])
+  @@index([userId])
+}
+
+/// Lançamento financeiro (receita ou despesa). `amount` é armazenado como
+/// Decimal (Req. 6.1, 7.1). Ocorrências recorrentes compartilham `recurrenceId`
+/// (Req. 6.5, 7.5).
+model Transaction {
+  id           String          @id @default(cuid())
+  userId       String
+  categoryId   String
+  type         TransactionType
+  description  String
+  amount       Decimal         @db.Decimal(12, 2)
+  date         DateTime        @db.Date
+  recurrenceId String?
+  createdAt    DateTime        @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@index([userId])
+  @@index([categoryId])
+  @@index([userId, date])
+  @@index([recurrenceId])
+}
+
+/// Meta financeira do usuário. Valores em Decimal; progresso e conclusão são
+/// derivados na camada de domínio (Req. 9.1, 9.2, 9.4).
+model Goal {
+  id                String   @id @default(cuid())
+  userId            String
+  description       String
+  targetAmount      Decimal  @db.Decimal(12, 2)
+  accumulatedAmount Decimal  @default(0) @db.Decimal(12, 2)
+  deadline          DateTime @db.Date
+  completed         Boolean  @default(false)
+  createdAt         DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Sessão persistida em banco (estratégia database sessions do Auth.js v5).
+/// Permite invalidação explícita e expiração por inatividade (Req. 2.4, 2.5,
+/// 2.7, 3.6, 14.3).
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  sessionToken String   @unique
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Registro de acesso para monitoramento administrativo (Req. 15.1, 15.2).
+model AccessLog {
+  id         String       @id @default(cuid())
+  userId     String
+  action     AccessAction
+  occurredAt DateTime     @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([occurredAt])
+}
+
+/// Registro de consentimento LGPD com data/hora e versão do termo (Req. 16.9).
+model ConsentRecord {
+  id           String   @id @default(cuid())
+  userId       String
+  termsVersion String
+  consentedAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Token de uso único para verificação de e-mail, redefinição de senha e
+/// alteração de e-mail. Armazenado como hash, com expiração e flag de uso
+/// (Req. 1.3, 1.4, 3.1, 3.2, 3.3, 4.4).
+model VerificationToken {
+  id        String       @id @default(cuid())
+  userId    String
+  purpose   TokenPurpose
+  tokenHash String       @unique
+  expiresAt DateTime
+  used      Boolean      @default(false)
+  createdAt DateTime     @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([purpose])
+}
